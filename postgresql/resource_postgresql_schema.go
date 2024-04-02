@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,7 +10,14 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/lib/pq"
 	acl "github.com/sean-/postgresql-acl"
 )
@@ -29,84 +37,117 @@ const (
 	schemaPolicyUsageWithGrantAttr  = "usage_with_grant"
 )
 
-func resourcePostgreSQLSchema() *schema.Resource {
-	return &schema.Resource{
-		Create: PGResourceFunc(resourcePostgreSQLSchemaCreate),
-		Read:   PGResourceFunc(resourcePostgreSQLSchemaRead),
-		Update: PGResourceFunc(resourcePostgreSQLSchemaUpdate),
-		Delete: PGResourceFunc(resourcePostgreSQLSchemaDelete),
-		Exists: PGResourceExistsFunc(resourcePostgreSQLSchemaExists),
-		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
-		},
+var _ resource.Resource = &ResourcePostgreSQLSchema{}
+var _ resource.ResourceWithConfigure = &ResourcePostgreSQLSchema{}
 
-		Schema: map[string]*schema.Schema{
-			schemaNameAttr: {
-				Type:        schema.TypeString,
+func NewResourceSchema() resource.Resource {
+	return &ResourcePostgreSQLSchema{}
+}
+
+type ResourcePostgreSQLSchema struct {
+	db *DBConnection
+}
+
+type ResourcePostgreSQLSchemaPolicyModel struct {
+	Create          types.Bool   `tfsdk:"create"`
+	CreateWithGrant types.Bool   `tfsdk:"create_with_grant"`
+	Role            types.String `tfsdk:"role"`
+	Usage           types.Bool   `tfsdk:"usage"`
+	UsageWithGrant  types.Bool   `tfsdk:"usage_with_grant"`
+}
+
+type ResourcePostgreSQLSchemaModel struct {
+	Id          types.String                        `tfsdk:"id"`
+	Name        types.String                        `tfsdk:"name"`
+	Database    types.String                        `tfsdk:"database"`
+	Owner       types.String                        `tfsdk:"owner"`
+	IfNotExists types.Bool                          `tfsdk:"if_not_exists"`
+	DropCascade types.Bool                          `tfsdk:"drop_cascade"`
+	Policies    ResourcePostgreSQLSchemaPolicyModel `tfsdk:"policy"`
+}
+
+// Create: PGResourceFunc(resourcePostgreSQLSchemaCreate),
+// Read:   PGResourceFunc(resourcePostgreSQLSchemaRead),
+// Update: PGResourceFunc(resourcePostgreSQLSchemaUpdate),
+// Delete: PGResourceFunc(resourcePostgreSQLSchemaDelete),
+// Exists: PGResourceExistsFunc(resourcePostgreSQLSchemaExists),
+// Importer: &schema.ResourceImporter{
+// 	StateContext: schema.ImportStatePassthroughContext,
+// },
+
+func (r *ResourcePostgreSQLSchema) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_schema"
+}
+
+func (r *ResourcePostgreSQLSchema) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				Computed: true,
+			},
+			"name": schema.StringAttribute{
 				Required:    true,
 				Description: "The name of the schema",
 			},
-			schemaDatabaseAttr: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Computed:    true,
-				ForceNew:    true,
+			"database": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 				Description: "The database name to alter schema",
 			},
-			schemaOwnerAttr: {
-				Type:        schema.TypeString,
+			"owner": schema.StringAttribute{
 				Optional:    true,
 				Computed:    true,
 				Description: "The ROLE name who owns the schema",
 			},
-			schemaIfNotExists: {
-				Type:        schema.TypeBool,
+			"if_not_exists": schema.BoolAttribute{
+				Computed:    true,
 				Optional:    true,
-				Default:     true,
+				Default:     booldefault.StaticBool(true),
 				Description: "When true, use the existing schema if it exists",
 			},
-			schemaDropCascade: {
-				Type:        schema.TypeBool,
+			"drop_cascade": schema.BoolAttribute{
+				Computed:    true,
 				Optional:    true,
-				Default:     false,
+				Default:     booldefault.StaticBool(false),
 				Description: "When true, will also drop all the objects that are contained in the schema",
 			},
-			schemaPolicyAttr: {
-				Type:       schema.TypeSet,
-				Optional:   true,
-				Computed:   true,
-				Deprecated: "Use postgresql_grant resource instead (with object_type=\"schema\")",
-				Elem: &schema.Resource{
-					Schema: map[string]*schema.Schema{
-						schemaPolicyCreateAttr: {
-							Type:        schema.TypeBool,
+		},
+		Blocks: map[string]schema.Block{
+			"policy": schema.SetNestedBlock{
+				DeprecationMessage: "Use postgresql_grant resource instead (with object_type=\"schema\")",
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"create": schema.BoolAttribute{
+							Computed:    true,
 							Optional:    true,
-							Default:     false,
+							Default:     booldefault.StaticBool(false),
 							Description: "If true, allow the specified ROLEs to CREATE new objects within the schema(s)",
 						},
-						schemaPolicyCreateWithGrantAttr: {
-							Type:        schema.TypeBool,
+						"create_with_grant": schema.BoolAttribute{
+							Computed:    true,
 							Optional:    true,
-							Default:     false,
+							Default:     booldefault.StaticBool(false),
 							Description: "If true, allow the specified ROLEs to CREATE new objects within the schema(s) and GRANT the same CREATE privilege to different ROLEs",
 						},
-						schemaPolicyRoleAttr: {
-							Type:        schema.TypeString,
-							Elem:        &schema.Schema{Type: schema.TypeString},
+						"role": schema.StringAttribute{
+							Computed:    true,
 							Optional:    true,
-							Default:     "",
+							Default:     stringdefault.StaticString(""),
 							Description: "ROLE who will receive this policy (default: PUBLIC)",
 						},
-						schemaPolicyUsageAttr: {
-							Type:        schema.TypeBool,
+						"usage": schema.BoolAttribute{
+							Computed:    true,
 							Optional:    true,
-							Default:     false,
+							Default:     booldefault.StaticBool(false),
 							Description: "If true, allow the specified ROLEs to use objects within the schema(s)",
 						},
-						schemaPolicyUsageWithGrantAttr: {
-							Type:        schema.TypeBool,
+						"usage_with_grant": schema.BoolAttribute{
+							Computed:    true,
 							Optional:    true,
-							Default:     false,
+							Default:     booldefault.StaticBool(false),
 							Description: "If true, allow the specified ROLEs to use objects within the schema(s) and GRANT the same USAGE privilege to different ROLEs",
 						},
 					},
@@ -116,11 +157,36 @@ func resourcePostgreSQLSchema() *schema.Resource {
 	}
 }
 
-func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) error {
-	database := getDatabase(d, db.client.databaseName)
-	txn, err := startTransaction(db.client, database)
+func (r *ResourcePostgreSQLSchema) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	db, err := GetDBConnection(req.ProviderData)
+
 	if err != nil {
-		return err
+		resp.Diagnostics.AddError("Failed to establish DB connection", err.Error())
+		return
+	}
+
+	r.db = db
+}
+
+func (r *ResourcePostgreSQLSchema) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	// db, err := GetDBConnection(req.ProviderMeta)
+
+	var data ResourcePostgreSQLSchemaModel
+	req.Config.Get(ctx, &data)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	database := getDatabaseName(&data.Database, r.db.client.databaseName)
+	txn, err := startTransaction(r.db.client, database)
+	if err != nil {
+		resp.Diagnostics.AddError("unable to start transaction", err.Error())
+		return
 	}
 	defer deferredRollback(txn)
 
@@ -132,52 +198,55 @@ func resourcePostgreSQLSchemaCreate(db *DBConnection, d *schema.ResourceData) er
 
 	dbOwner, err := getDatabaseOwner(txn, database)
 	if err != nil {
-		return err
+		resp.Diagnostics.AddError("unable to get database owner", err.Error())
+		return
 	}
 	rolesToGrant = append(rolesToGrant, dbOwner)
 
-	schemaOwner := d.Get("owner").(string)
+	schemaOwner := data.Owner.ValueString()
 	if schemaOwner != "" && schemaOwner != dbOwner {
 		rolesToGrant = append(rolesToGrant, schemaOwner)
-
 	}
 
-	if err := withRolesGranted(txn, rolesToGrant, func() error {
-		return createSchema(db, txn, d)
-	}); err != nil {
-		return err
+	err = withRolesGranted(txn, rolesToGrant, func() error {
+		return createSchema(r.db, txn, &data)
+	})
+
+	if err != nil {
+		resp.Diagnostics.AddError("unable to grant roles", err.Error())
+		return
 	}
 
 	if err := txn.Commit(); err != nil {
-		return fmt.Errorf("Error committing schema: %w", err)
+		resp.Diagnostics.AddError("error committing schema", err.Error())
+		return
 	}
 
-	d.SetId(generateSchemaID(d, database))
+	readSchema(r.db, &data)
 
-	return resourcePostgreSQLSchemaReadImpl(db, d)
+	resp.Diagnostics.Append(resp.State.Set(ctx, data)...)
 }
 
-func createSchema(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
-	schemaName := d.Get(schemaNameAttr).(string)
+func createSchema(db *DBConnection, txn *sql.Tx, s *ResourcePostgreSQLSchemaModel) error {
 
 	// Check if previous tasks haven't already create schema
 	var foundSchema bool
-	err := txn.QueryRow(`SELECT TRUE FROM pg_catalog.pg_namespace WHERE nspname = $1`, schemaName).Scan(&foundSchema)
+	err := txn.QueryRow(`SELECT TRUE FROM pg_catalog.pg_namespace WHERE nspname = $1`, s.Name.ValueString()).Scan(&foundSchema)
 
 	queries := []string{}
 	switch {
 	case err == sql.ErrNoRows:
 		b := bytes.NewBufferString("CREATE SCHEMA ")
 		if db.featureSupported(featureSchemaCreateIfNotExist) {
-			if v := d.Get(schemaIfNotExists); v.(bool) {
+			if s.IfNotExists.ValueBool() {
 				fmt.Fprint(b, "IF NOT EXISTS ")
 			}
 		}
-		fmt.Fprint(b, pq.QuoteIdentifier(schemaName))
+		fmt.Fprint(b, pq.QuoteIdentifier(s.Name.ValueString()))
 
-		switch v, ok := d.GetOk(schemaOwnerAttr); {
+		switch v, ok := s.Owner.ValueString(), !s.Owner.IsNull(); {
 		case ok:
-			fmt.Fprint(b, " AUTHORIZATION ", pq.QuoteIdentifier(v.(string)))
+			fmt.Fprint(b, " AUTHORIZATION ", pq.QuoteIdentifier(v))
 		}
 		queries = append(queries, b.String())
 
@@ -186,7 +255,7 @@ func createSchema(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 
 	default:
 		// The schema already exists, we just set the owner.
-		if err := setSchemaOwner(txn, d); err != nil {
+		if err := setSchemaOwner(txn, s); err != nil {
 			return err
 		}
 	}
@@ -195,26 +264,27 @@ func createSchema(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	type RoleKey string
 	var schemaPolicies map[RoleKey]acl.Schema
 
-	if policiesRaw, ok := d.GetOk(schemaPolicyAttr); ok {
-		policiesList := policiesRaw.(*schema.Set).List()
+	// if policiesRaw, ok := d.GetOk(schemaPolicyAttr); ok {
+	// 	policiesList := policiesRaw.(*schema.Set).List()
 
-		// NOTE: len(policiesList) doesn't take into account multiple
-		// roles per policy.
-		schemaPolicies = make(map[RoleKey]acl.Schema, len(policiesList))
+	// 	// NOTE: len(policiesList) doesn't take into account multiple
+	// 	// roles per policy.
+	// 	schemaPolicies = make(map[RoleKey]acl.Schema, len(policiesList))
 
-		for _, policyRaw := range policiesList {
-			policyMap := policyRaw.(map[string]interface{})
-			rolePolicy := schemaPolicyToACL(policyMap)
+	// 	for _, policyRaw := range policiesList {
+	// 		policyMap := policyRaw.(map[string]interface{})
+	// 		rolePolicy := schemaPolicyToACL(policyMap)
 
-			roleKey := RoleKey(strings.ToLower(rolePolicy.Role))
-			if existingRolePolicy, ok := schemaPolicies[roleKey]; ok {
-				schemaPolicies[roleKey] = existingRolePolicy.Merge(rolePolicy)
-			} else {
-				schemaPolicies[roleKey] = rolePolicy
-			}
-		}
-	}
+	// 		roleKey := RoleKey(strings.ToLower(rolePolicy.Role))
+	// 		if existingRolePolicy, ok := schemaPolicies[roleKey]; ok {
+	// 			schemaPolicies[roleKey] = existingRolePolicy.Merge(rolePolicy)
+	// 		} else {
+	// 			schemaPolicies[roleKey] = rolePolicy
+	// 		}
+	// 	}
+	// }
 
+	schemaName := s.Name.ValueString()
 	for _, policy := range schemaPolicies {
 		queries = append(queries, policy.Grants(schemaName)...)
 	}
@@ -228,31 +298,37 @@ func createSchema(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) error {
-	database := getDatabase(d, db.client.databaseName)
+func (r *ResourcePostgreSQLSchema) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var data ResourcePostgreSQLSchemaModel
 
-	txn, err := startTransaction(db.client, database)
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+
+	database := getDatabaseName(&data.Database, r.db.client.databaseName)
+
+	txn, err := startTransaction(r.db.client, database)
 	if err != nil {
-		return err
+		resp.Diagnostics.AddError("unable to start transaction", err.Error())
+		return
 	}
 	defer deferredRollback(txn)
 
-	schemaName := d.Get(schemaNameAttr).(string)
+	schemaName := data.Name.ValueString()
 
 	exists, err := schemaExists(txn, schemaName)
 	if err != nil {
-		return err
-	}
-	if !exists {
-		d.SetId("")
-		return nil
+		resp.Diagnostics.AddError("unable to check if schema exists", err.Error())
+		return
 	}
 
-	owner := d.Get("owner").(string)
+	if !exists {
+		return
+	}
+
+	owner := data.Owner.ValueString()
 
 	if err = withRolesGranted(txn, []string{owner}, func() error {
 		dropMode := "RESTRICT"
-		if d.Get(schemaDropCascade).(bool) {
+		if data.DropCascade.ValueBool() {
 			dropMode = "CASCADE"
 		}
 
@@ -263,53 +339,58 @@ func resourcePostgreSQLSchemaDelete(db *DBConnection, d *schema.ResourceData) er
 
 		return nil
 	}); err != nil {
-		return err
+		resp.Diagnostics.AddError("unable to grant roles for schema", err.Error())
+		return
 	}
 
 	if err := txn.Commit(); err != nil {
-		return fmt.Errorf("Error committing schema: %w", err)
+		resp.Diagnostics.AddError("error committing schema", err.Error())
+		return
 	}
 
-	d.SetId("")
-
-	return nil
 }
 
-func resourcePostgreSQLSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
-	database, schemaName, err := getDBSchemaName(d, db.client.databaseName)
-	if err != nil {
-		return false, err
-	}
+// func resourcePostgreSQLSchemaExists(db *DBConnection, d *schema.ResourceData) (bool, error) {
+// 	database, schemaName, err := getDBSchemaName(d, db.client.databaseName)
+// 	if err != nil {
+// 		return false, err
+// 	}
 
-	// Check if the database exists
-	exists, err := dbExists(db, database)
-	if err != nil || !exists {
-		return false, err
-	}
+// 	// Check if the database exists
+// 	exists, err := dbExists(db, database)
+// 	if err != nil || !exists {
+// 		return false, err
+// 	}
 
-	txn, err := startTransaction(db.client, database)
-	if err != nil {
-		return false, err
-	}
-	defer deferredRollback(txn)
+// 	txn, err := startTransaction(db.client, database)
+// 	if err != nil {
+// 		return false, err
+// 	}
+// 	defer deferredRollback(txn)
 
-	err = txn.QueryRow("SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaName)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("Error reading schema: %w", err)
-	}
+// 	err = txn.QueryRow("SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.nspname=$1", schemaName).Scan(&schemaName)
+// 	switch {
+// 	case err == sql.ErrNoRows:
+// 		return false, nil
+// 	case err != nil:
+// 		return false, fmt.Errorf("Error reading schema: %w", err)
+// 	}
 
-	return true, nil
+// 	return true, nil
+// }
+
+func (r *ResourcePostgreSQLSchema) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var data ResourcePostgreSQLSchemaModel
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &data)...)
+
+	readSchema(r.db, &data)
+
+	resp.State.Set(ctx, data)
 }
 
-func resourcePostgreSQLSchemaRead(db *DBConnection, d *schema.ResourceData) error {
-	return resourcePostgreSQLSchemaReadImpl(db, d)
-}
-
-func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) error {
-	database, schemaName, err := getDBSchemaName(d, db.client.databaseName)
+func readSchema(db *DBConnection, s *ResourcePostgreSQLSchemaModel) error {
+	database, schemaName, err := getDBSchemaName(s, db.client.databaseName)
 	if err != nil {
 		return err
 	}
@@ -326,7 +407,7 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 	switch {
 	case err == sql.ErrNoRows:
 		log.Printf("[WARN] PostgreSQL schema (%s) not found in database %s", schemaName, database)
-		d.SetId("")
+		s.Id = types.StringValue("")
 		return nil
 	case err != nil:
 		return fmt.Errorf("Error reading schema: %w", err)
@@ -354,77 +435,84 @@ func resourcePostgreSQLSchemaReadImpl(db *DBConnection, d *schema.ResourceData) 
 			schemaPolicies[roleKey] = mergedPolicy
 		}
 
-		d.Set(schemaNameAttr, schemaName)
-		d.Set(schemaOwnerAttr, schemaOwner)
-		d.Set(schemaDatabaseAttr, database)
-		d.SetId(generateSchemaID(d, database))
+		s.Name = types.StringValue(schemaName)
+		s.Owner = types.StringValue(schemaOwner)
+		s.Database = types.StringValue(database)
+		s.Id = types.StringValue(generateSchemaID(s, database))
 
 		return nil
 	}
 }
 
-func resourcePostgreSQLSchemaUpdate(db *DBConnection, d *schema.ResourceData) error {
-	databaseName := getDatabase(d, db.client.databaseName)
+func (r *ResourcePostgreSQLSchema) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var planData, stateData ResourcePostgreSQLSchemaModel
 
-	txn, err := startTransaction(db.client, databaseName)
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &planData)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &stateData)...)
+
+	databaseName := getDatabaseName(&planData.Database, r.db.client.databaseName)
+
+	txn, err := startTransaction(r.db.client, databaseName)
 	if err != nil {
-		return err
+		resp.Diagnostics.AddError("unable to start transaction", err.Error())
+		return
 	}
 	defer deferredRollback(txn)
 
-	if err := setSchemaName(txn, d, databaseName); err != nil {
-		return err
+	if planData.Name.Equal(stateData.Name) {
+		oldSchemaName := stateData.Name.ValueString()
+		newSchemaName := planData.Name.ValueString()
+		tflog.Info(ctx, fmt.Sprintf("renaming schema from %s to %s", oldSchemaName, newSchemaName))
+		if err := setSchemaName(txn, oldSchemaName, newSchemaName, databaseName); err != nil {
+			resp.Diagnostics.AddError("unable to alter schema name", err.Error())
+			return
+		}
+		// TODO finish this section
+		stateData.Id = types.StringValue(generateSchemaID(s, databaseName))
 	}
 
-	if err := setSchemaOwner(txn, d); err != nil {
-		return err
+	if err := setSchemaOwner(txn, &planData); err != nil {
+		resp.Diagnostics.AddError("unable to set schema owner", err.Error())
+		return
 	}
 
-	if err := setSchemaPolicy(txn, d); err != nil {
-		return err
+	if err := setSchemaPolicy(txn, &planData); err != nil {
+		resp.Diagnostics.AddError("unable to update schema policy", err.Error())
+		return
 	}
 
 	if err := txn.Commit(); err != nil {
-		return fmt.Errorf("Error committing schema: %w", err)
+		resp.Diagnostics.AddError("error committing schema", err.Error())
+		return
 	}
 
-	return resourcePostgreSQLSchemaReadImpl(db, d)
+	readSchema(r.db, &planData)
 }
 
-func setSchemaName(txn *sql.Tx, d *schema.ResourceData, databaseName string) error {
-	if !d.HasChange(schemaNameAttr) {
-		return nil
-	}
-
-	oraw, nraw := d.GetChange(schemaNameAttr)
-	o := oraw.(string)
-	n := nraw.(string)
-	if n == "" {
+func setSchemaName(txn *sql.Tx, oldSchemaName string, newSchemaName string, databaseName string) error {
+	if newSchemaName == "" {
 		return errors.New("Error setting schema name to an empty string")
 	}
 
-	sql := fmt.Sprintf("ALTER SCHEMA %s RENAME TO %s", pq.QuoteIdentifier(o), pq.QuoteIdentifier(n))
+	sql := fmt.Sprintf("ALTER SCHEMA %s RENAME TO %s", pq.QuoteIdentifier(oldSchemaName), pq.QuoteIdentifier(newSchemaName))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("Error updating schema NAME: %w", err)
 	}
-	d.SetId(generateSchemaID(d, databaseName))
 
 	return nil
 }
 
-func setSchemaOwner(txn *sql.Tx, d *schema.ResourceData) error {
-	if !d.HasChange(schemaOwnerAttr) {
-		return nil
-	}
+func setSchemaOwner(txn *sql.Tx, s *ResourcePostgreSQLSchemaModel) error {
+	// TODO only do this if the value changes
+	// if !d.HasChange(schemaOwnerAttr) {
+	// 	return nil
+	// }
 
-	schemaName := d.Get(schemaNameAttr).(string)
-	schemaOwner := d.Get(schemaOwnerAttr).(string)
-
-	if schemaOwner == "" {
+	if s.Owner.ValueString() == "" {
 		return errors.New("Error setting schema owner to an empty string")
 	}
 
-	sql := fmt.Sprintf("ALTER SCHEMA %s OWNER TO %s", pq.QuoteIdentifier(schemaName), pq.QuoteIdentifier(schemaOwner))
+	sql := fmt.Sprintf("ALTER SCHEMA %s OWNER TO %s", pq.QuoteIdentifier(s.Name.ValueString()), pq.QuoteIdentifier(s.Owner.ValueString()))
 	if _, err := txn.Exec(sql); err != nil {
 		return fmt.Errorf("Error updating schema OWNER: %w", err)
 	}
@@ -432,79 +520,80 @@ func setSchemaOwner(txn *sql.Tx, d *schema.ResourceData) error {
 	return nil
 }
 
-func setSchemaPolicy(txn *sql.Tx, d *schema.ResourceData) error {
-	if !d.HasChange(schemaPolicyAttr) {
-		return nil
-	}
+func setSchemaPolicy(txn *sql.Tx, s *ResourcePostgreSQLSchemaModel) error {
+	// TODO detect changes
+	// if !d.HasChange(schemaPolicyAttr) {
+	// 	return nil
+	// }
 
-	schemaName := d.Get(schemaNameAttr).(string)
-	owner := d.Get(schemaOwnerAttr).(string)
+	// schemaName := s.Name.ValueString()
 
-	oraw, nraw := d.GetChange(schemaPolicyAttr)
-	oldList := oraw.(*schema.Set).List()
-	newList := nraw.(*schema.Set).List()
-	queries := make([]string, 0, len(oldList)+len(newList))
-	dropped, added, updated, _ := schemaChangedPolicies(oldList, newList)
+	// oraw, nraw := d.GetChange(schemaPolicyAttr)
+	// oldList := oraw.(*schema.Set).List()
+	// newList := nraw.(*schema.Set).List()
+	// queries := make([]string, 0, len(oldList)+len(newList))
+	// dropped, added, updated, _ := schemaChangedPolicies(oldList, newList)
 
-	for _, p := range dropped {
-		pMap := p.(map[string]interface{})
-		rolePolicy := schemaPolicyToACL(pMap)
+	// for _, p := range dropped {
+	// 	pMap := p.(map[string]interface{})
+	// 	rolePolicy := schemaPolicyToACL(pMap)
 
-		// The PUBLIC role can not be DROP'ed, therefore we do not need
-		// to prevent revoking against it not existing.
-		if rolePolicy.Role != "" {
-			var foundUser bool
-			err := txn.QueryRow(`SELECT TRUE FROM pg_catalog.pg_roles WHERE rolname = $1`, rolePolicy.Role).Scan(&foundUser)
-			switch {
-			case err == sql.ErrNoRows:
-				// Don't execute this role's REVOKEs because the role
-				// was dropped first and therefore doesn't exist.
-			case err != nil:
-				return fmt.Errorf("Error reading schema: %w", err)
-			default:
-				queries = append(queries, rolePolicy.Revokes(schemaName)...)
-			}
-		}
-	}
+	// 	// The PUBLIC role can not be DROP'ed, therefore we do not need
+	// 	// to prevent revoking against it not existing.
+	// 	if rolePolicy.Role != "" {
+	// 		var foundUser bool
+	// 		err := txn.QueryRow(`SELECT TRUE FROM pg_catalog.pg_roles WHERE rolname = $1`, rolePolicy.Role).Scan(&foundUser)
+	// 		switch {
+	// 		case err == sql.ErrNoRows:
+	// 			// Don't execute this role's REVOKEs because the role
+	// 			// was dropped first and therefore doesn't exist.
+	// 		case err != nil:
+	// 			return fmt.Errorf("Error reading schema: %w", err)
+	// 		default:
+	// 			queries = append(queries, rolePolicy.Revokes(schemaName)...)
+	// 		}
+	// 	}
+	// }
 
-	for _, p := range added {
-		pMap := p.(map[string]interface{})
-		rolePolicy := schemaPolicyToACL(pMap)
-		queries = append(queries, rolePolicy.Grants(schemaName)...)
-	}
+	// for _, p := range added {
+	// 	pMap := p.(map[string]interface{})
+	// 	rolePolicy := schemaPolicyToACL(pMap)
+	// 	queries = append(queries, rolePolicy.Grants(schemaName)...)
+	// }
 
-	for _, p := range updated {
-		policies := p.([]interface{})
-		if len(policies) != 2 {
-			panic("expected 2 policies, old and new")
-		}
+	// for _, p := range updated {
+	// 	policies := p.([]interface{})
+	// 	if len(policies) != 2 {
+	// 		panic("expected 2 policies, old and new")
+	// 	}
 
-		{
-			oldPolicies := policies[0].(map[string]interface{})
-			rolePolicy := schemaPolicyToACL(oldPolicies)
-			queries = append(queries, rolePolicy.Revokes(schemaName)...)
-		}
+	// 	{
+	// 		oldPolicies := policies[0].(map[string]interface{})
+	// 		rolePolicy := schemaPolicyToACL(oldPolicies)
+	// 		queries = append(queries, rolePolicy.Revokes(schemaName)...)
+	// 	}
 
-		{
-			newPolicies := policies[1].(map[string]interface{})
-			rolePolicy := schemaPolicyToACL(newPolicies)
-			queries = append(queries, rolePolicy.Grants(schemaName)...)
-		}
-	}
+	// 	{
+	// 		newPolicies := policies[1].(map[string]interface{})
+	// 		rolePolicy := schemaPolicyToACL(newPolicies)
+	// 		queries = append(queries, rolePolicy.Grants(schemaName)...)
+	// 	}
+	// }
 
-	rolesToGrant := []string{}
-	if owner != "" {
-		rolesToGrant = append(rolesToGrant, owner)
-	}
+	// rolesToGrant := []string{}
+	// if !s.Owner.IsNull() {
+	// 	rolesToGrant = append(rolesToGrant, s.Owner.ValueString())
+	// }
 
-	return withRolesGranted(txn, rolesToGrant, func() error {
-		for _, query := range queries {
-			if _, err := txn.Exec(query); err != nil {
-				return fmt.Errorf("Error updating schema DCL: %w", err)
-			}
-		}
-		return nil
-	})
+	// return withRolesGranted(txn, rolesToGrant, func() error {
+	// 	for _, query := range queries {
+	// 		if _, err := txn.Exec(query); err != nil {
+	// 			return fmt.Errorf("Error updating schema DCL: %w", err)
+	// 		}
+	// 	}
+	// 	return nil
+	// })
+	return nil
 }
 
 // schemaChangedPolicies walks old and new to create a set of queries that can
@@ -592,24 +681,25 @@ func schemaPolicyToACL(policyMap map[string]interface{}) acl.Schema {
 	return rolePolicy
 }
 
-func generateSchemaID(d *schema.ResourceData, databaseName string) string {
+func generateSchemaID(s *ResourcePostgreSQLSchemaModel, databaseName string) string {
 	SchemaID := strings.Join([]string{
-		getDatabase(d, databaseName),
-		d.Get(schemaNameAttr).(string),
+		getDatabaseName(&s.Database, databaseName),
+		s.Name.ValueString(),
 	}, ".")
 
 	return SchemaID
 }
 
-func getDBSchemaName(d *schema.ResourceData, databaseName string) (string, string, error) {
-	database := getDatabase(d, databaseName)
-	schemaName := d.Get(schemaNameAttr).(string)
+func getDBSchemaName(s *ResourcePostgreSQLSchemaModel, databaseName string) (string, string, error) {
+	database := getDatabaseName(&s.Database, databaseName)
+	schemaName := s.Name.ValueString()
+	id := s.Id.ValueString()
 
 	// When importing, we have to parse the ID to find schema and database names.
 	if schemaName == "" {
-		parsed := strings.Split(d.Id(), ".")
+		parsed := strings.Split(id, ".")
 		if len(parsed) != 2 {
-			return "", "", fmt.Errorf("schema ID %s has not the expected format 'database.schema': %v", d.Id(), parsed)
+			return "", "", fmt.Errorf("schema ID %s has not the expected format 'database.schema': %v", id, parsed)
 		}
 		database = parsed[0]
 		schemaName = parsed[1]

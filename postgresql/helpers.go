@@ -4,9 +4,12 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/lib/pq"
 )
@@ -22,6 +25,54 @@ func PGResourceFunc(fn func(*DBConnection, *schema.ResourceData) error) func(*sc
 
 		return fn(db, d)
 	}
+}
+
+func GetDBConnection(providerMeta interface{}) (*DBConnection, error) {
+	client, ok := providerMeta.(*Client)
+	if !ok {
+		return nil, fmt.Errorf("unable to configure db client")
+	}
+
+	db, err := client.Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func GetIntFromAttributeOrEnv(configAttr types.Int64, envKey string, defaultValue int64) int64 {
+	if !configAttr.IsNull() {
+		return configAttr.ValueInt64()
+	} else if v := os.Getenv(envKey); v != "" {
+		i, err := strconv.Atoi(v)
+		if err == nil {
+			return int64(i)
+		}
+	}
+
+	return defaultValue
+}
+
+func GetFromAttributeOrEnv(configAttr types.String, envKey string, defaultValue string) string {
+	if !configAttr.IsNull() {
+		return configAttr.ValueString()
+	} else if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	return defaultValue
+}
+
+func GetBoolFromAttributeOrEnv(configAttr types.Bool, envKey string, defaultValue bool) bool {
+	if !configAttr.IsNull() {
+		return configAttr.ValueBool()
+	} else if v := os.Getenv(envKey); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
+		}
+	}
+	return defaultValue
 }
 
 func PGResourceExistsFunc(fn func(*DBConnection, *schema.ResourceData) (bool, error)) func(*schema.ResourceData, interface{}) (bool, error) {
@@ -414,6 +465,14 @@ func deferredRollback(txn *sql.Tx) {
 func getDatabase(d *schema.ResourceData, databaseName string) string {
 	if v, ok := d.GetOk(extDatabaseAttr); ok {
 		databaseName = v.(string)
+	}
+
+	return databaseName
+}
+
+func getDatabaseName(resourceDatabaseName *types.String, databaseName string) string {
+	if !resourceDatabaseName.IsNull() {
+		return resourceDatabaseName.ValueString()
 	}
 
 	return databaseName
