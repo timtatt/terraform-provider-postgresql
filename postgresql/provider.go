@@ -226,9 +226,7 @@ func (p *PostgresqlProvider) Configure(ctx context.Context, req provider.Configu
 }
 
 func (p *PostgresqlProvider) Resources(ctx context.Context) []func() resource.Resource {
-	return []func() resource.Resource{
-		NewResourceSchema,
-	}
+	return []func() resource.Resource{}
 }
 
 func (p *PostgresqlProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
